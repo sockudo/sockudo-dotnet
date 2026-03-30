@@ -1,6 +1,8 @@
 # Sockudo.Client
 
-Sockudo C# client SDK for .NET.
+Official .NET client SDK for Sockudo.
+
+`Sockudo.Client` is a Pusher-compatible realtime client for .NET applications. It preserves the familiar subscribe/bind/channel model while adding Sockudo-native features such as filter-aware subscriptions, delta reconstruction, and encrypted channel handling.
 
 ## Features
 
@@ -14,8 +16,241 @@ Sockudo C# client SDK for .NET.
 - Fossil and Xdelta3/VCDIFF delta support
 - Encrypted channel shared-secret payload decryption
 
-## Build
+## Installation
+
+.NET CLI:
 
 ```bash
-dotnet test client-sdks/sockudo-csharp/tests/Sockudo.Client.Tests/Sockudo.Client.Tests.csproj
+dotnet add package Sockudo.Client
 ```
+
+NuGet Package Manager:
+
+```
+Install-Package Sockudo.Client
+```
+
+For local development from this workspace, reference the project directly:
+
+```xml
+<ProjectReference Include="../../client-sdks/sockudo-dotnet/src/Sockudo.Client/Sockudo.Client.csproj" />
+```
+
+## Quick Start
+
+```csharp
+using Sockudo.Client;
+
+var client = new SockudoClient(
+    "app-key",
+    new SockudoOptions
+    {
+        Cluster = "local",
+        ForceTls = false,
+        WsHost = "127.0.0.1",
+        WsPort = 6001,
+    }
+);
+
+var channel = client.Subscribe("public-updates");
+channel.Bind("price-updated", (data, meta) => Console.WriteLine(data));
+
+await client.ConnectAsync();
+await Task.Delay(TimeSpan.FromSeconds(30));
+await client.DisconnectAsync();
+```
+
+## Advanced Usage
+
+### Private Channel Authorization
+
+Use an endpoint URL (the default) or supply a fully custom async handler:
+
+```csharp
+using Sockudo.Client;
+
+var client = new SockudoClient(
+    "app-key",
+    new SockudoOptions
+    {
+        Cluster = "local",
+        WsHost = "127.0.0.1",
+        WsPort = 6001,
+        ChannelAuthorization = new ChannelAuthorizationOptions(
+            Endpoint: "https://api.example.com/sockudo/auth",
+            // Or override entirely:
+            CustomHandler: async request =>
+            {
+                // Call your own backend to produce a signed auth token.
+                return new ChannelAuthorizationData(
+                    Auth: "app-key:hmac-sha256-signature",
+                    ChannelData: """{"user_id":"42"}"""
+                );
+            }
+        ),
+    }
+);
+
+var channel = client.Subscribe("private-orders");
+channel.Bind("order-placed", (data, meta) => Console.WriteLine(data));
+
+await client.ConnectAsync();
+```
+
+### Presence Channels
+
+```csharp
+var channel = client.Subscribe("presence-lobby");
+
+channel.Bind("pusher:subscription_succeeded", (data, meta) =>
+    Console.WriteLine($"members: {data}"));
+channel.Bind("pusher:member_added", (data, meta) =>
+    Console.WriteLine($"joined: {data}"));
+channel.Bind("pusher:member_removed", (data, meta) =>
+    Console.WriteLine($"left: {data}"));
+
+await client.ConnectAsync();
+```
+
+### Tag Filter Subscriptions
+
+Server-side tag filtering is a V2 feature. Only messages whose tags match the filter expression are delivered to this subscription.
+
+```csharp
+using Sockudo.Client;
+
+var channel = client.Subscribe(
+    "price:btc",
+    new SubscriptionOptions(
+        Filter: Filter.Eq("market", "spot")
+    )
+);
+
+// Compound filters
+var channel2 = client.Subscribe(
+    "price:btc",
+    new SubscriptionOptions(
+        Filter: Filter.And(
+            Filter.Eq("market", "spot"),
+            Filter.Gt("spread", "0")
+        )
+    )
+);
+```
+
+### Delta Compression
+
+Request delta-compressed delivery to reduce bandwidth for channels that carry frequently-updated payloads:
+
+```csharp
+var channel = client.Subscribe(
+    "orderbook:btc-usd",
+    new SubscriptionOptions(
+        Delta: new ChannelDeltaSettings(Enabled: true, Algorithm: DeltaAlgorithm.Xdelta3)
+    )
+);
+channel.Bind("snapshot", (data, meta) => Console.WriteLine(data));
+```
+
+### Encrypted Channels
+
+`private-encrypted-*` channels decrypt payloads automatically using the `SharedSecret` returned by your auth endpoint or custom handler.
+
+```csharp
+var channel = client.Subscribe("private-encrypted-documents");
+channel.Bind("doc-updated", (data, meta) => Console.WriteLine(data)); // data is already decrypted
+```
+
+Your auth handler must populate `SharedSecret` in `ChannelAuthorizationData`:
+
+```csharp
+CustomHandler: async request => new ChannelAuthorizationData(
+    Auth: "app-key:hmac-sha256-signature",
+    SharedSecret: "base64-encoded-32-byte-secret"
+)
+```
+
+### User Sign-In
+
+```csharp
+var client = new SockudoClient(
+    "app-key",
+    new SockudoOptions
+    {
+        Cluster = "local",
+        WsHost = "127.0.0.1",
+        WsPort = 6001,
+        UserAuthentication = new UserAuthenticationOptions(
+            Endpoint: "https://api.example.com/sockudo/user-auth"
+        ),
+    }
+);
+
+await client.ConnectAsync();
+await client.User.SignInAsync();
+```
+
+### Connection State Events
+
+```csharp
+client.Connection.StateChanged += (sender, change) =>
+    Console.WriteLine($"connection: {change.Previous} -> {change.Current}");
+
+client.Connection.Connected += (sender, data) =>
+    Console.WriteLine($"connected, socket id: {data.SocketId}");
+
+client.Connection.Disconnected += (sender, _) =>
+    Console.WriteLine("disconnected");
+
+client.Connection.Reconnecting += (sender, _) =>
+    Console.WriteLine("reconnecting...");
+
+await client.ConnectAsync();
+```
+
+### Protocol V2
+
+V2 is the default. To explicitly request it or to downgrade to V1 for strict Pusher SDK compatibility:
+
+```csharp
+// V2 (default) — enables serial tracking, message_id, recovery, filters, delta
+var client = new SockudoClient("app-key", new SockudoOptions { Protocol = 2 });
+
+// V1 — plain Pusher protocol, compatible with official Pusher SDKs
+var client = new SockudoClient("app-key", new SockudoOptions { Protocol = 1 });
+```
+
+## Requirements
+
+- .NET 6+ or .NET 8+
+
+## Testing
+
+Run the unit and integration test suite:
+
+```bash
+dotnet test client-sdks/sockudo-dotnet/tests/Sockudo.Client.Tests/Sockudo.Client.Tests.csproj
+```
+
+Live integration tests against a local Sockudo server on port `6001`:
+
+```bash
+SOCKUDO_LIVE_TESTS=1 dotnet test client-sdks/sockudo-dotnet/tests/Sockudo.Client.Tests/Sockudo.Client.Tests.csproj
+```
+
+The live suite covers:
+
+- public subscribe + publish round-trip
+- delta-enabled channel delivery
+- encrypted channel decryption
+
+## CI/CD
+
+GitHub Actions:
+
+- CI: `.github/workflows/ci.yml`
+- Publish: `.github/workflows/publish.yml`
+
+## Status
+
+The package covers the core Sockudo feature set, including encrypted channels and both supported delta algorithms, and is suitable for publishing as the official .NET SDK.
