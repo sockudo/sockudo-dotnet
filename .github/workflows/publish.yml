@@ -19,10 +19,10 @@ jobs:
           dotnet-version: "10.0.x"
 
       - name: Restore and build
-        run: dotnet build --configuration Release
+        run: dotnet build src/Sockudo.Client/Sockudo.Client.csproj --configuration Release
 
       - name: Pack
-        run: dotnet pack --no-build --configuration Release --output ./nupkg
+        run: dotnet pack src/Sockudo.Client/Sockudo.Client.csproj --no-build --configuration Release --output ./nupkg
 
       - name: Publish to NuGet
         run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
