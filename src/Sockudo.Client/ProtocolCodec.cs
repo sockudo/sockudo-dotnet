@@ -22,6 +22,7 @@ public static class ProtocolCodec
         "extras",
         "__delta_seq",
         "__conflation_key",
+        "stream_id",
     };
 
     public static object EncodeEnvelope(IDictionary<string, object?> envelope, SockudoWireFormat wireFormat)
@@ -57,6 +58,7 @@ public static class ProtocolCodec
             Data: data,
             UserId: envelope.TryGetValue("user_id", out var userId) ? userId as string : null,
             MessageId: envelope.TryGetValue("message_id", out var messageId) ? messageId as string : null,
+            StreamId: envelope.TryGetValue("stream_id", out var streamId) ? streamId as string : null,
             RawMessage: rawText,
             Sequence: CoerceInt(envelope.TryGetValue("__delta_seq", out var deltaSeq) ? deltaSeq : envelope.Get("sequence")),
             ConflationKey: envelope.TryGetValue("__conflation_key", out var deltaKey) ? deltaKey as string : envelope.Get("conflation_key") as string,
@@ -127,6 +129,7 @@ public static class ProtocolCodec
             EncodeMessagePackExtras(envelope.Get("extras")),
             envelope.Get("__delta_seq"),
             envelope.Get("__conflation_key"),
+            envelope.Get("stream_id"),
         };
         return MessagePackSerializer.Serialize(payload);
     }
@@ -255,6 +258,7 @@ public static class ProtocolCodec
         }
         ProtoWriter.WriteUInt64(output, 13, CoerceUInt64(envelope.Get("__delta_seq")));
         ProtoWriter.WriteString(output, 14, envelope.Get("__conflation_key") as string);
+        ProtoWriter.WriteString(output, 15, envelope.Get("stream_id") as string);
         return output.ToArray();
     }
 
@@ -342,6 +346,9 @@ public static class ProtocolCodec
                     break;
                 case 14:
                     envelope["__conflation_key"] = reader.ReadString();
+                    break;
+                case 15:
+                    envelope["stream_id"] = reader.ReadString();
                     break;
                 default:
                     reader.Skip(wireType);

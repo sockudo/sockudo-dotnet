@@ -42,6 +42,8 @@ public sealed class ProtocolTests
                 ["event"] = "sockudo:test",
                 ["channel"] = "chat:room-1",
                 ["data"] = new Dictionary<string, object?> { ["hello"] = "world", ["count"] = 3 },
+                ["stream_id"] = "stream-1",
+                ["serial"] = 7,
                 ["__delta_seq"] = 7,
                 ["__conflation_key"] = "room",
             },
@@ -55,6 +57,8 @@ public sealed class ProtocolTests
         var data = Assert.IsType<Dictionary<string, object?>>(decoded.Data);
         Assert.Equal("world", data["hello"]);
         Assert.Equal(3L, data["count"]);
+        Assert.Equal("stream-1", decoded.StreamId);
+        Assert.Equal(7, decoded.Serial);
         Assert.Equal(7, decoded.Sequence);
         Assert.Equal("room", decoded.ConflationKey);
     }
@@ -68,6 +72,8 @@ public sealed class ProtocolTests
                 ["event"] = "sockudo:test",
                 ["channel"] = "chat:room-1",
                 ["data"] = new Dictionary<string, object?> { ["hello"] = "world" },
+                ["stream_id"] = "stream-2",
+                ["serial"] = 9,
                 ["__delta_seq"] = 11,
                 ["__conflation_key"] = "btc",
                 ["extras"] = new Dictionary<string, object?>
@@ -85,6 +91,8 @@ public sealed class ProtocolTests
         Assert.Equal("chat:room-1", decoded.Channel);
         var data = Assert.IsType<Dictionary<string, object?>>(decoded.Data);
         Assert.Equal("world", data["hello"]);
+        Assert.Equal("stream-2", decoded.StreamId);
+        Assert.Equal(9, decoded.Serial);
         Assert.Equal(11, decoded.Sequence);
         Assert.Equal("btc", decoded.ConflationKey);
         Assert.NotNull(decoded.Extras);
@@ -159,5 +167,57 @@ public sealed class ProtocolTests
         decoder.Decode(out _);
 
         Assert.Equal(updated, Encoding.UTF8.GetString(result.ToArray()));
+    }
+
+    [Fact]
+    public void PresenceHistoryParamsPreferNormalizedTimeBounds()
+    {
+        var payload = new PresenceHistoryParams(
+            Direction: "newest_first",
+            Limit: 50,
+            Start: 1000,
+            End: 2000
+        ).ToPayload();
+
+        Assert.Equal("newest_first", payload["direction"]);
+        Assert.Equal(50, payload["limit"]);
+        Assert.Equal(1000L, payload["start_time_ms"]);
+        Assert.Equal(2000L, payload["end_time_ms"]);
+        Assert.DoesNotContain("start", payload.Keys);
+        Assert.DoesNotContain("end", payload.Keys);
+    }
+
+    [Fact]
+    public async Task PresenceHistoryPageNextUsesNextCursor()
+    {
+        string? capturedCursor = null;
+        var page = new PresenceHistoryPage(
+            Array.Empty<PresenceHistoryItem>(),
+            "newest_first",
+            50,
+            true,
+            "cursor-2",
+            new PresenceHistoryBounds(null, null, null, null),
+            new PresenceHistoryContinuity(null, null, null, null, null, 0, 0, false, true, false),
+            cursor =>
+            {
+                capturedCursor = cursor;
+                return Task.FromResult(
+                    new PresenceHistoryPage(
+                        Array.Empty<PresenceHistoryItem>(),
+                        "newest_first",
+                        50,
+                        false,
+                        null,
+                        new PresenceHistoryBounds(null, null, null, null),
+                        new PresenceHistoryContinuity(null, null, null, null, null, 0, 0, false, true, false)
+                    )
+                );
+            }
+        );
+
+        Assert.True(page.HasNext());
+        await page.NextAsync();
+        Assert.Equal("cursor-2", capturedCursor);
     }
 }

@@ -8,8 +8,9 @@ Official .NET client SDK for Sockudo.
 
 - Protocol V2 by default, with V1 compatibility
 - Public, private, presence, and encrypted channel types
+- Proxy-backed presence history and presence snapshot helpers
 - Tag filters and per-subscription event filters
-- Connection recovery serial tracking
+- Continuity-aware connection recovery (`stream_id` + `serial`)
 - Message deduplication
 - User sign-in and watchlist event handling
 - JSON, MessagePack, and Protobuf codecs
@@ -112,6 +113,37 @@ channel.Bind("pusher:member_removed", (data, meta) =>
 await client.ConnectAsync();
 ```
 
+### Presence History
+
+Client-side presence history is proxy-backed. `Sockudo.Client` does not sign the server REST API directly; configure `PresenceHistory.Endpoint` to call your own backend proxy, which then signs and forwards the request to Sockudo.
+
+```csharp
+var client = new SockudoClient(
+    "app-key",
+    new SockudoOptions(
+        Cluster: "local",
+        WsHost: "127.0.0.1",
+        WsPort: 6001,
+        PresenceHistory: new PresenceHistoryOptions(
+            Endpoint: "https://api.example.com/sockudo/presence-history"
+        )
+    )
+);
+
+var channel = (PresenceChannel)client.Subscribe("presence-lobby");
+var page = await channel.HistoryAsync(
+    new PresenceHistoryParams(Limit: 50, Direction: "newest_first")
+);
+if (page.HasNext())
+{
+    var nextPage = await page.NextAsync();
+}
+
+var snapshot = await channel.SnapshotAsync(
+    new PresenceSnapshotParams(AtSerial: 4)
+);
+```
+
 ### Tag Filter Subscriptions
 
 Server-side tag filtering is a V2 feature. Only messages whose tags match the filter expression are delivered to this subscription.
@@ -138,7 +170,7 @@ var channel2 = client.Subscribe(
 );
 ```
 
-### Delta Compression
+### Delta Compression And Rewind
 
 Request delta-compressed delivery to reduce bandwidth for channels that carry frequently-updated payloads:
 
@@ -150,6 +182,16 @@ var channel = client.Subscribe(
     )
 );
 channel.Bind("snapshot", (data, meta) => Console.WriteLine(data));
+
+var rewindChannel = client.Subscribe(
+    "market:btc",
+    new SubscriptionOptions(
+        Rewind: new SubscriptionRewind.Seconds(30)
+    )
+);
+
+client.Bind("sockudo:resume_success", (data, _) => Console.WriteLine(data));
+rewindChannel.Bind("sockudo:rewind_complete", (data, _) => Console.WriteLine(data));
 ```
 
 ### Encrypted Channels
@@ -213,7 +255,7 @@ await client.ConnectAsync();
 V2 is the default. To explicitly request it or to downgrade to V1 for strict Pusher SDK compatibility:
 
 ```csharp
-// V2 (default) — enables serial tracking, message_id, recovery, filters, delta
+// V2 (default) — enables continuity tokens, message_id, recovery, filters, delta
 var client = new SockudoClient("app-key", new SockudoOptions { Protocol = 2 });
 
 // V1 — plain Pusher protocol, compatible with official Pusher SDKs

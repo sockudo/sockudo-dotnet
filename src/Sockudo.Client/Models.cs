@@ -77,8 +77,25 @@ public sealed record MessageExtras(
 public sealed record SubscriptionOptions(
     FilterNode? Filter = null,
     ChannelDeltaSettings? Delta = null,
-    IReadOnlyList<string>? Events = null
+    IReadOnlyList<string>? Events = null,
+    SubscriptionRewind? Rewind = null
 );
+
+public abstract record SubscriptionRewind
+{
+    internal abstract object SubscriptionValue();
+
+    public sealed record Count(int Value) : SubscriptionRewind
+    {
+        internal override object SubscriptionValue() => Value;
+    }
+
+    public sealed record Seconds(int Value) : SubscriptionRewind
+    {
+        internal override object SubscriptionValue() =>
+            new Dictionary<string, object> { ["seconds"] = Value };
+    }
+}
 
 public sealed record DeltaOptions(
     bool? Enabled = null,
@@ -132,6 +149,150 @@ public sealed record UserAuthenticationOptions(
     UserAuthenticationHandler? CustomHandler = null
 );
 
+public sealed record PresenceHistoryOptions(
+    string Endpoint,
+    IDictionary<string, string>? Headers = null,
+    Func<IDictionary<string, string>>? HeadersProvider = null
+);
+
+public sealed record PresenceHistoryParams(
+    string? Direction = null,
+    int? Limit = null,
+    string? Cursor = null,
+    long? StartSerial = null,
+    long? EndSerial = null,
+    long? StartTimeMs = null,
+    long? EndTimeMs = null,
+    long? Start = null,
+    long? End = null
+)
+{
+    public IDictionary<string, object> ToPayload()
+    {
+        var payload = new Dictionary<string, object>(StringComparer.Ordinal);
+        if (Direction is not null) payload["direction"] = Direction;
+        if (Limit is not null) payload["limit"] = Limit.Value;
+        if (Cursor is not null) payload["cursor"] = Cursor;
+        if (StartSerial is not null) payload["start_serial"] = StartSerial.Value;
+        if (EndSerial is not null) payload["end_serial"] = EndSerial.Value;
+        if (StartTimeMs is not null) payload["start_time_ms"] = StartTimeMs.Value;
+        else if (Start is not null) payload["start_time_ms"] = Start.Value;
+        if (EndTimeMs is not null) payload["end_time_ms"] = EndTimeMs.Value;
+        else if (End is not null) payload["end_time_ms"] = End.Value;
+        return payload;
+    }
+}
+
+public sealed record PresenceSnapshotParams(
+    long? AtTimeMs = null,
+    long? At = null,
+    long? AtSerial = null
+)
+{
+    public IDictionary<string, object> ToPayload()
+    {
+        var payload = new Dictionary<string, object>(StringComparer.Ordinal);
+        if (AtTimeMs is not null) payload["at_time_ms"] = AtTimeMs.Value;
+        else if (At is not null) payload["at_time_ms"] = At.Value;
+        if (AtSerial is not null) payload["at_serial"] = AtSerial.Value;
+        return payload;
+    }
+}
+
+public sealed record PresenceHistoryItem(
+    string StreamId,
+    long Serial,
+    long PublishedAtMs,
+    string Event,
+    string Cause,
+    string UserId,
+    string? ConnectionId,
+    string? DeadNodeId,
+    int PayloadSizeBytes,
+    IDictionary<string, object?> PresenceEvent
+);
+
+public sealed record PresenceHistoryBounds(
+    long? StartSerial,
+    long? EndSerial,
+    long? StartTimeMs,
+    long? EndTimeMs
+);
+
+public sealed record PresenceHistoryContinuity(
+    string? StreamId,
+    long? OldestAvailableSerial,
+    long? NewestAvailableSerial,
+    long? OldestAvailablePublishedAtMs,
+    long? NewestAvailablePublishedAtMs,
+    long RetainedEvents,
+    long RetainedBytes,
+    bool Degraded,
+    bool Complete,
+    bool TruncatedByRetention
+);
+
+public sealed class PresenceHistoryPage
+{
+    private readonly Func<string, Task<PresenceHistoryPage>>? _fetchNext;
+
+    public PresenceHistoryPage(
+        IReadOnlyList<PresenceHistoryItem> items,
+        string direction,
+        int limit,
+        bool hasMore,
+        string? nextCursor,
+        PresenceHistoryBounds bounds,
+        PresenceHistoryContinuity continuity,
+        Func<string, Task<PresenceHistoryPage>>? fetchNext = null)
+    {
+        Items = items;
+        Direction = direction;
+        Limit = limit;
+        HasMore = hasMore;
+        NextCursor = nextCursor;
+        Bounds = bounds;
+        Continuity = continuity;
+        _fetchNext = fetchNext;
+    }
+
+    public IReadOnlyList<PresenceHistoryItem> Items { get; }
+    public string Direction { get; }
+    public int Limit { get; }
+    public bool HasMore { get; }
+    public string? NextCursor { get; }
+    public PresenceHistoryBounds Bounds { get; }
+    public PresenceHistoryContinuity Continuity { get; }
+
+    public bool HasNext() => HasMore && !string.IsNullOrEmpty(NextCursor);
+
+    public Task<PresenceHistoryPage> NextAsync()
+    {
+        if (!HasNext() || _fetchNext is null || NextCursor is null)
+        {
+            throw new SockudoException("No more pages available");
+        }
+        return _fetchNext(NextCursor);
+    }
+}
+
+public sealed record PresenceSnapshotMember(
+    string UserId,
+    string LastEvent,
+    long LastEventSerial,
+    long LastEventAtMs
+);
+
+public sealed record PresenceSnapshot(
+    string Channel,
+    IReadOnlyList<PresenceSnapshotMember> Members,
+    int MemberCount,
+    long EventsReplayed,
+    long? SnapshotSerial,
+    long? SnapshotTimeMs,
+    PresenceHistoryContinuity Continuity
+);
+
 public sealed record SockudoOptions(
     string Cluster,
     int ProtocolVersion = 2,
@@ -154,6 +315,7 @@ public sealed record SockudoOptions(
     IDictionary<string, object>? TimelineParams = null,
     ChannelAuthorizationOptions? ChannelAuthorization = null,
     UserAuthenticationOptions? UserAuthentication = null,
+    PresenceHistoryOptions? PresenceHistory = null,
     DeltaOptions? DeltaCompression = null,
     bool MessageDeduplication = true,
     int MessageDeduplicationCapacity = 1000,
@@ -184,11 +346,18 @@ public sealed record SockudoEvent(
     object? Data,
     string? UserId,
     string? MessageId,
+    string? StreamId,
     string RawMessage,
     int? Sequence = null,
     string? ConflationKey = null,
     int? Serial = null,
     MessageExtras? Extras = null
+);
+
+internal sealed record RecoveryPosition(
+    int Serial,
+    string? StreamId = null,
+    string? LastMessageId = null
 );
 
 internal static class JsonSupport

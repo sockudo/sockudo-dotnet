@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Net.Http.Json;
 using System.Net.Http.Headers;
 using System.Net.WebSockets;
 using System.Text;
@@ -46,7 +47,7 @@ public sealed class SockudoClient : IAsyncDisposable
     private readonly Dictionary<string, SockudoChannel> _channels = new(StringComparer.Ordinal);
     private readonly MessageDeduplicator? _deduplicator;
     private readonly SemaphoreSlim _socketGate = new(1, 1);
-    private readonly Dictionary<string, int> _channelSerials = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, RecoveryPosition> _channelPositions = new(StringComparer.Ordinal);
     private readonly DeltaCompressionManager? _deltaManager;
     private ClientWebSocket? _socket;
     private CancellationTokenSource? _socketCts;
@@ -137,6 +138,7 @@ public sealed class SockudoClient : IAsyncDisposable
             channel.Filter = subscriptionOptions.Filter;
             channel.DeltaSettings = subscriptionOptions.Delta;
             channel.EventsFilter = subscriptionOptions.Events;
+            channel.Rewind = subscriptionOptions.Rewind;
         }
 
         channel.SubscribeIfPossible();
@@ -164,7 +166,7 @@ public sealed class SockudoClient : IAsyncDisposable
             _channels.Remove(channelName);
         }
 
-        _channelSerials.Remove(channelName);
+        _channelPositions.Remove(channelName);
         _deltaManager?.ClearChannelState(channelName);
     }
 
@@ -361,7 +363,11 @@ public sealed class SockudoClient : IAsyncDisposable
 
             if (Options.ConnectionRecovery && @event.Channel is not null && @event.Serial is not null)
             {
-                _channelSerials[@event.Channel] = @event.Serial.Value;
+                _channelPositions[@event.Channel] = new RecoveryPosition(
+                    @event.Serial.Value,
+                    @event.StreamId,
+                    @event.MessageId
+                );
             }
 
             if (@event.Event == _prefix.Event("connection_established"))
@@ -375,9 +381,24 @@ public sealed class SockudoClient : IAsyncDisposable
                     channel.SubscribeIfPossible();
                 }
 
-                if (Options.ConnectionRecovery && _channelSerials.Count > 0)
+                if (Options.ConnectionRecovery && _channelPositions.Count > 0)
                 {
-                    await SendEventAsync(_prefix.Event("resume"), new Dictionary<string, object?> { ["channel_serials"] = new Dictionary<string, int>(_channelSerials) }).ConfigureAwait(false);
+                    var channelPositions = _channelPositions.ToDictionary(
+                        entry => entry.Key,
+                        entry => (object?)new Dictionary<string, object?>
+                        {
+                            ["serial"] = entry.Value.Serial,
+                            ["stream_id"] = entry.Value.StreamId,
+                            ["last_message_id"] = entry.Value.LastMessageId,
+                        }.Where(pair => pair.Value is not null)
+                         .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal),
+                        StringComparer.Ordinal
+                    );
+                    await SendEventAsync(
+                        _prefix.Event("resume"),
+                        new Dictionary<string, object?> { ["channel_positions"] = channelPositions },
+                        null
+                    ).ConfigureAwait(false);
                 }
 
                 if (Options.DeltaCompression?.Enabled == true && _deltaManager is not null)
@@ -419,7 +440,7 @@ public sealed class SockudoClient : IAsyncDisposable
                 var channelName = payloadData?.Get("channel") as string;
                 if (channelName is not null)
                 {
-                    _channelSerials.Remove(channelName);
+                    _channelPositions.Remove(channelName);
                     _deltaManager?.ClearChannelState(channelName);
                     if (_channels.TryGetValue(channelName, out var failedChannel))
                     {
@@ -734,6 +755,172 @@ public sealed class SockudoClient : IAsyncDisposable
         return payload;
     }
 
+    internal async Task<PresenceHistoryPage> FetchPresenceHistoryAsync(
+        string channelName,
+        PresenceHistoryParams parameters,
+        CancellationToken cancellationToken = default)
+    {
+        var config = Options.PresenceHistory ?? throw new UnsupportedFeature(
+            "PresenceHistory.Endpoint must be configured to use presence.history(). This endpoint should proxy requests to the Sockudo server REST API.");
+
+        var payload = await PerformPresenceHistoryRequestAsync(
+            config.Endpoint,
+            config.Headers,
+            config.HeadersProvider,
+            channelName,
+            parameters.ToPayload(),
+            "history",
+            cancellationToken).ConfigureAwait(false);
+
+        return DecodePresenceHistoryPage(
+            payload,
+            cursor => FetchPresenceHistoryAsync(channelName, parameters with { Cursor = cursor }, cancellationToken));
+    }
+
+    internal async Task<PresenceSnapshot> FetchPresenceSnapshotAsync(
+        string channelName,
+        PresenceSnapshotParams parameters,
+        CancellationToken cancellationToken = default)
+    {
+        var config = Options.PresenceHistory ?? throw new UnsupportedFeature(
+            "PresenceHistory.Endpoint must be configured to use presence.snapshot(). This endpoint should proxy requests to the Sockudo server REST API.");
+
+        var payload = await PerformPresenceHistoryRequestAsync(
+            config.Endpoint,
+            config.Headers,
+            config.HeadersProvider,
+            channelName,
+            parameters.ToPayload(),
+            "snapshot",
+            cancellationToken).ConfigureAwait(false);
+
+        return DecodePresenceSnapshot(payload);
+    }
+
+    private async Task<Dictionary<string, object?>> PerformPresenceHistoryRequestAsync(
+        string endpoint,
+        IDictionary<string, string>? staticHeaders,
+        Func<IDictionary<string, string>>? dynamicHeaders,
+        string channelName,
+        IDictionary<string, object> parameters,
+        string action,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+        request.Content = JsonContent.Create(new Dictionary<string, object?>
+        {
+            ["channel"] = channelName,
+            ["params"] = parameters,
+            ["action"] = action,
+        });
+
+        if (staticHeaders is not null)
+        {
+            foreach (var header in staticHeaders)
+            {
+                request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+            }
+        }
+        if (dynamicHeaders is not null)
+        {
+            foreach (var header in dynamicHeaders())
+            {
+                request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+            }
+        }
+
+        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        var content = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new SockudoException($"Presence {action} request failed ({(int)response.StatusCode}): {content}");
+        }
+
+        var payload = JsonSupport.Decode(content) as Dictionary<string, object?>;
+        if (payload is null)
+        {
+            throw new SockudoException($"Presence {action} endpoint returned invalid JSON");
+        }
+        return payload;
+    }
+
+    private static PresenceHistoryPage DecodePresenceHistoryPage(
+        Dictionary<string, object?> payload,
+        Func<string, Task<PresenceHistoryPage>> fetchNext)
+    {
+        var items = (payload.Get("items") as IEnumerable<object?> ?? Array.Empty<object?>())
+            .OfType<Dictionary<string, object?>>()
+            .Select(item => new PresenceHistoryItem(
+                item.Get("stream_id") as string ?? string.Empty,
+                Convert.ToInt64(item.Get("serial") ?? 0),
+                Convert.ToInt64(item.Get("published_at_ms") ?? 0),
+                item.Get("event") as string ?? string.Empty,
+                item.Get("cause") as string ?? string.Empty,
+                item.Get("user_id") as string ?? string.Empty,
+                item.Get("connection_id") as string,
+                item.Get("dead_node_id") as string,
+                Convert.ToInt32(item.Get("payload_size_bytes") ?? 0),
+                item.Get("presence_event") as Dictionary<string, object?> ?? new Dictionary<string, object?>()))
+            .ToArray();
+
+        return new PresenceHistoryPage(
+            items,
+            payload.Get("direction") as string ?? "oldest_first",
+            Convert.ToInt32(payload.Get("limit") ?? 0),
+            payload.Get("has_more") as bool? ?? false,
+            payload.Get("next_cursor") as string,
+            DecodePresenceHistoryBounds(payload.Get("bounds") as Dictionary<string, object?>),
+            DecodePresenceHistoryContinuity(payload.Get("continuity") as Dictionary<string, object?>),
+            fetchNext);
+    }
+
+    private static PresenceSnapshot DecodePresenceSnapshot(Dictionary<string, object?> payload)
+    {
+        var members = (payload.Get("members") as IEnumerable<object?> ?? Array.Empty<object?>())
+            .OfType<Dictionary<string, object?>>()
+            .Select(member => new PresenceSnapshotMember(
+                member.Get("user_id") as string ?? string.Empty,
+                member.Get("last_event") as string ?? string.Empty,
+                Convert.ToInt64(member.Get("last_event_serial") ?? 0),
+                Convert.ToInt64(member.Get("last_event_at_ms") ?? 0)))
+            .ToArray();
+
+        return new PresenceSnapshot(
+            payload.Get("channel") as string ?? string.Empty,
+            members,
+            Convert.ToInt32(payload.Get("member_count") ?? 0),
+            Convert.ToInt64(payload.Get("events_replayed") ?? 0),
+            payload.Get("snapshot_serial") is null ? null : Convert.ToInt64(payload.Get("snapshot_serial")),
+            payload.Get("snapshot_time_ms") is null ? null : Convert.ToInt64(payload.Get("snapshot_time_ms")),
+            DecodePresenceHistoryContinuity(payload.Get("continuity") as Dictionary<string, object?>));
+    }
+
+    private static PresenceHistoryBounds DecodePresenceHistoryBounds(Dictionary<string, object?>? payload)
+    {
+        payload ??= new Dictionary<string, object?>();
+        return new PresenceHistoryBounds(
+            payload.Get("start_serial") is null ? null : Convert.ToInt64(payload.Get("start_serial")),
+            payload.Get("end_serial") is null ? null : Convert.ToInt64(payload.Get("end_serial")),
+            payload.Get("start_time_ms") is null ? null : Convert.ToInt64(payload.Get("start_time_ms")),
+            payload.Get("end_time_ms") is null ? null : Convert.ToInt64(payload.Get("end_time_ms")));
+    }
+
+    private static PresenceHistoryContinuity DecodePresenceHistoryContinuity(Dictionary<string, object?>? payload)
+    {
+        payload ??= new Dictionary<string, object?>();
+        return new PresenceHistoryContinuity(
+            payload.Get("stream_id") as string,
+            payload.Get("oldest_available_serial") is null ? null : Convert.ToInt64(payload.Get("oldest_available_serial")),
+            payload.Get("newest_available_serial") is null ? null : Convert.ToInt64(payload.Get("newest_available_serial")),
+            payload.Get("oldest_available_published_at_ms") is null ? null : Convert.ToInt64(payload.Get("oldest_available_published_at_ms")),
+            payload.Get("newest_available_published_at_ms") is null ? null : Convert.ToInt64(payload.Get("newest_available_published_at_ms")),
+            Convert.ToInt64(payload.Get("retained_events") ?? 0),
+            Convert.ToInt64(payload.Get("retained_bytes") ?? 0),
+            payload.Get("degraded") as bool? ?? false,
+            payload.Get("complete") as bool? ?? false,
+            payload.Get("truncated_by_retention") as bool? ?? false);
+    }
+
     public sealed class UserFacade
     {
         private readonly SockudoClient _client;
@@ -868,6 +1055,7 @@ public class SockudoChannel
     public FilterNode? Filter { get; internal set; }
     public ChannelDeltaSettings? DeltaSettings { get; internal set; }
     public IReadOnlyList<string>? EventsFilter { get; internal set; }
+    public SubscriptionRewind? Rewind { get; internal set; }
     public bool IsSubscribed { get; internal set; }
     public bool SubscriptionPending { get; internal set; }
     public bool SubscriptionCancelled { get; internal set; }
@@ -934,6 +1122,10 @@ public class SockudoChannel
             if (EventsFilter is not null)
             {
                 payload["events"] = EventsFilter;
+            }
+            if (Rewind is not null)
+            {
+                payload["rewind"] = Rewind.SubscriptionValue();
             }
 
             await Client.SendEventAsync(ClientPrefix().Event("subscribe"), payload).ConfigureAwait(false);
@@ -1079,6 +1271,16 @@ public sealed class PresenceChannel : PrivateChannel
         Members.Reset();
         base.Disconnect();
     }
+
+    public Task<PresenceHistoryPage> HistoryAsync(
+        PresenceHistoryParams? parameters = null,
+        CancellationToken cancellationToken = default) =>
+        Client.FetchPresenceHistoryAsync(Name, parameters ?? new PresenceHistoryParams(), cancellationToken);
+
+    public Task<PresenceSnapshot> SnapshotAsync(
+        PresenceSnapshotParams? parameters = null,
+        CancellationToken cancellationToken = default) =>
+        Client.FetchPresenceSnapshotAsync(Name, parameters ?? new PresenceSnapshotParams(), cancellationToken);
 }
 
 public sealed class EncryptedChannel : PrivateChannel
@@ -1327,7 +1529,7 @@ internal sealed class DeltaCompressionManager
                 var eventDataXdelta = parsedXdelta?.Get("data") ?? parsedXdelta;
                 HandleFullMessage(channel, reconstructedXdelta, sequence, conflationKey);
                 IncrementStats(deltaBytes.Length, reconstructedXdelta.Length, isDelta: true);
-                return new SockudoEvent(eventName, channel, eventDataXdelta, null, null, reconstructedXdelta, sequence, conflationKey);
+                return new SockudoEvent(eventName, channel, eventDataXdelta, null, null, null, reconstructedXdelta, sequence, conflationKey);
             }
 
             var reconstructed = Encoding.UTF8.GetString(FossilDelta.Apply(Encoding.UTF8.GetBytes(baseMessage), deltaBytes));
@@ -1335,7 +1537,7 @@ internal sealed class DeltaCompressionManager
             var eventData = parsed?.Get("data") ?? parsed;
             HandleFullMessage(channel, reconstructed, sequence, conflationKey);
             IncrementStats(deltaBytes.Length, reconstructed.Length, isDelta: true);
-            return new SockudoEvent(eventName, channel, eventData, null, null, reconstructed, sequence, conflationKey);
+            return new SockudoEvent(eventName, channel, eventData, null, null, null, reconstructed, sequence, conflationKey);
         }
         catch (Exception exception)
         {
