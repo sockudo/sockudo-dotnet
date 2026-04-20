@@ -155,6 +155,12 @@ public sealed record PresenceHistoryOptions(
     Func<IDictionary<string, string>>? HeadersProvider = null
 );
 
+public sealed record VersionedMessagesOptions(
+    string Endpoint,
+    IDictionary<string, string>? Headers = null,
+    Func<IDictionary<string, string>>? HeadersProvider = null
+);
+
 public sealed record PresenceHistoryParams(
     string? Direction = null,
     int? Limit = null,
@@ -293,6 +299,131 @@ public sealed record PresenceSnapshot(
     PresenceHistoryContinuity Continuity
 );
 
+public sealed record ChannelHistoryParams(
+    string? Direction = null,
+    int? Limit = null,
+    string? Cursor = null,
+    long? StartSerial = null,
+    long? EndSerial = null,
+    long? StartTimeMs = null,
+    long? EndTimeMs = null
+)
+{
+    public IDictionary<string, object> ToPayload()
+    {
+        var payload = new Dictionary<string, object>(StringComparer.Ordinal);
+        if (Direction is not null) payload["direction"] = Direction;
+        if (Limit is not null) payload["limit"] = Limit.Value;
+        if (Cursor is not null) payload["cursor"] = Cursor;
+        if (StartSerial is not null) payload["start_serial"] = StartSerial.Value;
+        if (EndSerial is not null) payload["end_serial"] = EndSerial.Value;
+        if (StartTimeMs is not null) payload["start_time_ms"] = StartTimeMs.Value;
+        if (EndTimeMs is not null) payload["end_time_ms"] = EndTimeMs.Value;
+        return payload;
+    }
+}
+
+public sealed class ChannelHistoryPageProxy
+{
+    private readonly Func<string, Task<ChannelHistoryPageProxy>>? _fetchNext;
+
+    public ChannelHistoryPageProxy(
+        IReadOnlyList<Dictionary<string, object?>> items,
+        string direction,
+        int limit,
+        bool hasMore,
+        string? nextCursor,
+        IDictionary<string, object?> bounds,
+        IDictionary<string, object?> continuity,
+        Func<string, Task<ChannelHistoryPageProxy>>? fetchNext = null)
+    {
+        Items = items;
+        Direction = direction;
+        Limit = limit;
+        HasMore = hasMore;
+        NextCursor = nextCursor;
+        Bounds = bounds;
+        Continuity = continuity;
+        _fetchNext = fetchNext;
+    }
+
+    public IReadOnlyList<Dictionary<string, object?>> Items { get; }
+    public string Direction { get; }
+    public int Limit { get; }
+    public bool HasMore { get; }
+    public string? NextCursor { get; }
+    public IDictionary<string, object?> Bounds { get; }
+    public IDictionary<string, object?> Continuity { get; }
+
+    public bool HasNext() => HasMore && NextCursor is not null;
+
+    public Task<ChannelHistoryPageProxy> NextAsync()
+    {
+        if (NextCursor is null || _fetchNext is null || !HasNext())
+        {
+            throw new InvalidOperationException("No more pages available");
+        }
+        return _fetchNext(NextCursor);
+    }
+}
+
+public sealed record MessageVersionsParams(
+    string? Direction = null,
+    int? Limit = null,
+    string? Cursor = null
+)
+{
+    public IDictionary<string, object> ToPayload()
+    {
+        var payload = new Dictionary<string, object>(StringComparer.Ordinal);
+        if (Direction is not null) payload["direction"] = Direction;
+        if (Limit is not null) payload["limit"] = Limit.Value;
+        if (Cursor is not null) payload["cursor"] = Cursor;
+        return payload;
+    }
+}
+
+public sealed class MessageVersionsPage
+{
+    private readonly Func<string, Task<MessageVersionsPage>>? _fetchNext;
+
+    public MessageVersionsPage(
+        string channel,
+        IReadOnlyList<Dictionary<string, object?>> items,
+        string direction,
+        int limit,
+        bool hasMore,
+        string? nextCursor,
+        Func<string, Task<MessageVersionsPage>>? fetchNext = null)
+    {
+        Channel = channel;
+        Items = items;
+        Direction = direction;
+        Limit = limit;
+        HasMore = hasMore;
+        NextCursor = nextCursor;
+        _fetchNext = fetchNext;
+    }
+
+    public string Channel { get; }
+    public IReadOnlyList<Dictionary<string, object?>> Items { get; }
+    public string Direction { get; }
+    public int Limit { get; }
+    public bool HasMore { get; }
+    public string? NextCursor { get; }
+
+    public bool HasNext() => HasMore && NextCursor is not null;
+
+    public Task<MessageVersionsPage> NextAsync()
+    {
+        if (NextCursor is null || _fetchNext is null || !HasNext())
+        {
+            throw new InvalidOperationException("No more pages available");
+        }
+        return _fetchNext(NextCursor);
+    }
+}
+
 public sealed record SockudoOptions(
     string Cluster,
     int ProtocolVersion = 2,
@@ -316,6 +447,7 @@ public sealed record SockudoOptions(
     ChannelAuthorizationOptions? ChannelAuthorization = null,
     UserAuthenticationOptions? UserAuthentication = null,
     PresenceHistoryOptions? PresenceHistory = null,
+    VersionedMessagesOptions? VersionedMessages = null,
     DeltaOptions? DeltaCompression = null,
     bool MessageDeduplication = true,
     int MessageDeduplicationCapacity = 1000,

@@ -797,6 +797,74 @@ public sealed class SockudoClient : IAsyncDisposable
         return DecodePresenceSnapshot(payload);
     }
 
+    internal async Task<ChannelHistoryPageProxy> FetchChannelHistoryAsync(
+        string channelName,
+        ChannelHistoryParams parameters,
+        CancellationToken cancellationToken = default)
+    {
+        var config = Options.VersionedMessages ?? throw new UnsupportedFeature(
+            "VersionedMessages.Endpoint must be configured to use channelHistory(). This endpoint should proxy requests to the Sockudo server REST API.");
+
+        var payload = await PerformPresenceHistoryRequestAsync(
+            config.Endpoint,
+            config.Headers,
+            config.HeadersProvider,
+            channelName,
+            parameters.ToPayload(),
+            "channel_history",
+            cancellationToken).ConfigureAwait(false);
+
+        return DecodeChannelHistoryPage(
+            payload,
+            cursor => FetchChannelHistoryAsync(channelName, parameters with { Cursor = cursor }, cancellationToken));
+    }
+
+    internal async Task<Dictionary<string, object?>> FetchLatestMessageAsync(
+        string channelName,
+        string messageSerial,
+        CancellationToken cancellationToken = default)
+    {
+        var config = Options.VersionedMessages ?? throw new UnsupportedFeature(
+            "VersionedMessages.Endpoint must be configured to use getMessage(). This endpoint should proxy requests to the Sockudo server REST API.");
+
+        var payload = await PerformPresenceHistoryRequestAsync(
+            config.Endpoint,
+            config.Headers,
+            config.HeadersProvider,
+            channelName,
+            new Dictionary<string, object>(),
+            "get_message",
+            cancellationToken,
+            messageSerial).ConfigureAwait(false);
+
+        return payload.Get("item") as Dictionary<string, object?> ?? new Dictionary<string, object?>();
+    }
+
+    internal async Task<MessageVersionsPage> FetchMessageVersionsAsync(
+        string channelName,
+        string messageSerial,
+        MessageVersionsParams parameters,
+        CancellationToken cancellationToken = default)
+    {
+        var config = Options.VersionedMessages ?? throw new UnsupportedFeature(
+            "VersionedMessages.Endpoint must be configured to use getMessageVersions(). This endpoint should proxy requests to the Sockudo server REST API.");
+
+        var payload = await PerformPresenceHistoryRequestAsync(
+            config.Endpoint,
+            config.Headers,
+            config.HeadersProvider,
+            channelName,
+            parameters.ToPayload(),
+            "get_message_versions",
+            cancellationToken,
+            messageSerial).ConfigureAwait(false);
+
+        return DecodeMessageVersionsPage(
+            payload,
+            channelName,
+            cursor => FetchMessageVersionsAsync(channelName, messageSerial, parameters with { Cursor = cursor }, cancellationToken));
+    }
+
     private async Task<Dictionary<string, object?>> PerformPresenceHistoryRequestAsync(
         string endpoint,
         IDictionary<string, string>? staticHeaders,
@@ -804,7 +872,8 @@ public sealed class SockudoClient : IAsyncDisposable
         string channelName,
         IDictionary<string, object> parameters,
         string action,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? messageSerial = null)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
         request.Content = JsonContent.Create(new Dictionary<string, object?>
@@ -812,6 +881,7 @@ public sealed class SockudoClient : IAsyncDisposable
             ["channel"] = channelName,
             ["params"] = parameters,
             ["action"] = action,
+            ["messageSerial"] = messageSerial,
         });
 
         if (staticHeaders is not null)
@@ -893,6 +963,44 @@ public sealed class SockudoClient : IAsyncDisposable
             payload.Get("snapshot_serial") is null ? null : Convert.ToInt64(payload.Get("snapshot_serial")),
             payload.Get("snapshot_time_ms") is null ? null : Convert.ToInt64(payload.Get("snapshot_time_ms")),
             DecodePresenceHistoryContinuity(payload.Get("continuity") as Dictionary<string, object?>));
+    }
+
+    private static ChannelHistoryPageProxy DecodeChannelHistoryPage(
+        Dictionary<string, object?> payload,
+        Func<string, Task<ChannelHistoryPageProxy>> fetchNext)
+    {
+        var items = (payload.Get("items") as IEnumerable<object?> ?? Array.Empty<object?>())
+            .OfType<Dictionary<string, object?>>()
+            .ToArray();
+
+        return new ChannelHistoryPageProxy(
+            items,
+            payload.Get("direction") as string ?? "oldest_first",
+            Convert.ToInt32(payload.Get("limit") ?? 0),
+            payload.Get("has_more") as bool? ?? false,
+            payload.Get("next_cursor") as string,
+            payload.Get("bounds") as Dictionary<string, object?> ?? new Dictionary<string, object?>(),
+            payload.Get("continuity") as Dictionary<string, object?> ?? new Dictionary<string, object?>(),
+            fetchNext);
+    }
+
+    private static MessageVersionsPage DecodeMessageVersionsPage(
+        Dictionary<string, object?> payload,
+        string channelName,
+        Func<string, Task<MessageVersionsPage>> fetchNext)
+    {
+        var items = (payload.Get("items") as IEnumerable<object?> ?? Array.Empty<object?>())
+            .OfType<Dictionary<string, object?>>()
+            .ToArray();
+
+        return new MessageVersionsPage(
+            payload.Get("channel") as string ?? channelName,
+            items,
+            payload.Get("direction") as string ?? "oldest_first",
+            Convert.ToInt32(payload.Get("limit") ?? 0),
+            payload.Get("has_more") as bool? ?? false,
+            payload.Get("next_cursor") as string,
+            fetchNext);
     }
 
     private static PresenceHistoryBounds DecodePresenceHistoryBounds(Dictionary<string, object?>? payload)
@@ -1281,6 +1389,22 @@ public sealed class PresenceChannel : PrivateChannel
         PresenceSnapshotParams? parameters = null,
         CancellationToken cancellationToken = default) =>
         Client.FetchPresenceSnapshotAsync(Name, parameters ?? new PresenceSnapshotParams(), cancellationToken);
+
+    public Task<ChannelHistoryPageProxy> ChannelHistoryAsync(
+        ChannelHistoryParams? parameters = null,
+        CancellationToken cancellationToken = default) =>
+        Client.FetchChannelHistoryAsync(Name, parameters ?? new ChannelHistoryParams(), cancellationToken);
+
+    public Task<Dictionary<string, object?>> GetMessageAsync(
+        string messageSerial,
+        CancellationToken cancellationToken = default) =>
+        Client.FetchLatestMessageAsync(Name, messageSerial, cancellationToken);
+
+    public Task<MessageVersionsPage> GetMessageVersionsAsync(
+        string messageSerial,
+        MessageVersionsParams? parameters = null,
+        CancellationToken cancellationToken = default) =>
+        Client.FetchMessageVersionsAsync(Name, messageSerial, parameters ?? new MessageVersionsParams(), cancellationToken);
 }
 
 public sealed class EncryptedChannel : PrivateChannel

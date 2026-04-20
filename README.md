@@ -194,6 +194,56 @@ client.Bind("sockudo:resume_success", (data, _) => Console.WriteLine(data));
 rewindChannel.Bind("sockudo:rewind_complete", (data, _) => Console.WriteLine(data));
 ```
 
+### Mutable Messages (Release 4.3)
+
+Protocol V2 mutable messages use:
+
+- `sockudo:message.update`
+- `sockudo:message.delete`
+- `sockudo:message.append`
+
+Client rule:
+
+- `message.update` replaces local content with the full event payload
+- `message.delete` is the latest visible version and may carry `null` data
+- `message.append` concatenates onto the current local string state
+
+If you receive `message.append` before you have a string base, fetch the latest visible message first and seed local state before applying more appends.
+
+For historical inspection, use:
+
+- `GET /apps/{appId}/channels/{channelName}/messages/{messageSerial}` for the latest visible version
+- `GET /apps/{appId}/channels/{channelName}/messages/{messageSerial}/versions` for preserved versions in `version_serial` order
+
+```csharp
+using Sockudo.Client;
+
+var client = new SockudoClient(
+    "app-key",
+    new SockudoOptions { Cluster = "local", WsHost = "127.0.0.1", WsPort = 6001, Protocol = 2 }
+);
+
+MutableMessageState? state = null;
+
+var channel = client.Subscribe("chat:room-1");
+channel.BindGlobal((eventName, data) =>
+{
+    if (data is not SockudoEvent ev || !MutableMessageReducer.IsMutableMessageEvent(ev))
+        return;
+    try
+    {
+        state = MutableMessageReducer.ReduceMutableMessageEvent(state, ev);
+        Console.WriteLine($"{state.MessageSerial} {state.Action} {state.Data}");
+    }
+    catch (InvalidOperationException ex)
+    {
+        Console.Error.WriteLine($"mutable message reduction failed: {ex.Message}");
+    }
+});
+
+await client.ConnectAsync();
+```
+
 ### Encrypted Channels
 
 `private-encrypted-*` channels decrypt payloads automatically using the `SharedSecret` returned by your auth endpoint or custom handler.
