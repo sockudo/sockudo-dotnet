@@ -294,11 +294,6 @@ public sealed class SockudoClient : IAsyncDisposable
         _socketCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         var socket = new ClientWebSocket();
-        if (Options.ProtocolVersion >= 2)
-        {
-            socket.Options.KeepAliveInterval = Options.EffectiveActivityTimeout;
-            socket.Options.KeepAliveTimeout = Options.EffectivePongTimeout;
-        }
         _socket = socket;
         await socket.ConnectAsync(new Uri(SocketUrl(transport)), _socketCts.Token).ConfigureAwait(false);
         _receiveLoop = ReceiveLoopAsync(socket, _socketCts.Token);
@@ -598,10 +593,6 @@ public sealed class SockudoClient : IAsyncDisposable
     private void ResetActivityTimer()
     {
         CancelActivityTimer();
-        if (Options.ProtocolVersion >= 2)
-        {
-            return;
-        }
         _activityLoop = Task.Run(async () =>
         {
             try

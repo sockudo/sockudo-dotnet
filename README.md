@@ -61,12 +61,6 @@ await Task.Delay(TimeSpan.FromSeconds(30));
 await client.DisconnectAsync();
 ```
 
-Protocol V2 heartbeat behavior:
-
-- Sockudo servers use native WebSocket ping/pong frames for automatic heartbeat traffic
-- .NET runtimes may still use lightweight `sockudo:ping` / `sockudo:pong` fallback messages for client-side activity checks when native ping APIs are not exposed through the active transport surface
-- fallback heartbeat messages are intentionally excluded from V2 recovery metadata such as `message_id`, `serial`, and `stream_id`
-
 ## Advanced Usage
 
 ### Private Channel Authorization
