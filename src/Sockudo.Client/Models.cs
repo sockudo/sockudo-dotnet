@@ -78,7 +78,8 @@ public sealed record SubscriptionOptions(
     FilterNode? Filter = null,
     ChannelDeltaSettings? Delta = null,
     IReadOnlyList<string>? Events = null,
-    SubscriptionRewind? Rewind = null
+    SubscriptionRewind? Rewind = null,
+    bool AnnotationSubscribe = false
 );
 
 public abstract record SubscriptionRewind
@@ -415,6 +416,101 @@ public sealed class MessageVersionsPage
     public bool HasNext() => HasMore && NextCursor is not null;
 
     public Task<MessageVersionsPage> NextAsync()
+    {
+        if (NextCursor is null || _fetchNext is null || !HasNext())
+        {
+            throw new InvalidOperationException("No more pages available");
+        }
+        return _fetchNext(NextCursor);
+    }
+}
+
+public sealed record PublishAnnotationRequest(
+    string Type,
+    string? Name = null,
+    int? Count = null,
+    IDictionary<string, object?>? Data = null,
+    string? ClientId = null,
+    IDictionary<string, object?>? Extras = null,
+    string? IdempotencyKey = null
+)
+{
+    public IDictionary<string, object?> ToPayload()
+    {
+        var payload = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["type"] = Type,
+        };
+        if (Name is not null) payload["name"] = Name;
+        if (Count is not null) payload["count"] = Count.Value;
+        if (Data is not null) payload["data"] = Data;
+        if (ClientId is not null) payload["clientId"] = ClientId;
+        if (Extras is not null) payload["extras"] = Extras;
+        if (IdempotencyKey is not null) payload["idempotencyKey"] = IdempotencyKey;
+        return payload;
+    }
+}
+
+public sealed record PublishAnnotationResponse(
+    IDictionary<string, object?> Annotation,
+    IDictionary<string, object?>? Summary = null
+);
+
+public sealed record DeleteAnnotationResponse(
+    bool Deleted,
+    string AnnotationSerial,
+    IDictionary<string, object?>? Summary = null
+);
+
+public sealed record AnnotationEventsParams(
+    string? Direction = null,
+    int? Limit = null,
+    string? Cursor = null,
+    string? Type = null,
+    string? FromSerial = null
+)
+{
+    public IDictionary<string, object> ToPayload()
+    {
+        var payload = new Dictionary<string, object>(StringComparer.Ordinal);
+        if (Direction is not null) payload["direction"] = Direction;
+        if (Limit is not null) payload["limit"] = Limit.Value;
+        if (Cursor is not null) payload["cursor"] = Cursor;
+        if (Type is not null) payload["type"] = Type;
+        if (FromSerial is not null) payload["from_serial"] = FromSerial;
+        return payload;
+    }
+}
+
+public sealed class AnnotationEventsPage
+{
+    private readonly Func<string, Task<AnnotationEventsPage>>? _fetchNext;
+
+    public AnnotationEventsPage(
+        IReadOnlyList<Dictionary<string, object?>> items,
+        string direction,
+        int limit,
+        bool hasMore,
+        string? nextCursor,
+        Func<string, Task<AnnotationEventsPage>>? fetchNext = null)
+    {
+        Items = items;
+        Direction = direction;
+        Limit = limit;
+        HasMore = hasMore;
+        NextCursor = nextCursor;
+        _fetchNext = fetchNext;
+    }
+
+    public IReadOnlyList<Dictionary<string, object?>> Items { get; }
+    public string Direction { get; }
+    public int Limit { get; }
+    public bool HasMore { get; }
+    public string? NextCursor { get; }
+
+    public bool HasNext() => HasMore && NextCursor is not null;
+
+    public Task<AnnotationEventsPage> NextAsync()
     {
         if (NextCursor is null || _fetchNext is null || !HasNext())
         {
