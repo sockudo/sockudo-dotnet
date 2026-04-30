@@ -139,6 +139,7 @@ public sealed class SockudoClient : IAsyncDisposable
             channel.DeltaSettings = subscriptionOptions.Delta;
             channel.EventsFilter = subscriptionOptions.Events;
             channel.Rewind = subscriptionOptions.Rewind;
+            channel.AnnotationSubscribe = subscriptionOptions.AnnotationSubscribe;
         }
 
         channel.SubscribeIfPossible();
@@ -874,6 +875,83 @@ public sealed class SockudoClient : IAsyncDisposable
             cursor => FetchMessageVersionsAsync(channelName, messageSerial, parameters with { Cursor = cursor }, cancellationToken));
     }
 
+    internal async Task<PublishAnnotationResponse> PublishAnnotationAsync(
+        string channelName,
+        string messageSerial,
+        PublishAnnotationRequest annotation,
+        CancellationToken cancellationToken = default)
+    {
+        var config = Options.VersionedMessages ?? throw new UnsupportedFeature(
+            "VersionedMessages.Endpoint must be configured to use publishAnnotation(). This endpoint should proxy requests to the Sockudo server REST API.");
+
+        var payload = await PerformPresenceHistoryRequestAsync(
+            config.Endpoint,
+            config.Headers,
+            config.HeadersProvider,
+            channelName,
+            new Dictionary<string, object>(),
+            "publish_annotation",
+            cancellationToken,
+            messageSerial,
+            annotation: annotation.ToPayload()).ConfigureAwait(false);
+
+        return new PublishAnnotationResponse(
+            payload.Get("annotation") as Dictionary<string, object?> ?? new Dictionary<string, object?>(),
+            payload.Get("summary") as Dictionary<string, object?>);
+    }
+
+    internal async Task<DeleteAnnotationResponse> DeleteAnnotationAsync(
+        string channelName,
+        string messageSerial,
+        string annotationSerial,
+        string? socketId,
+        CancellationToken cancellationToken = default)
+    {
+        var config = Options.VersionedMessages ?? throw new UnsupportedFeature(
+            "VersionedMessages.Endpoint must be configured to use deleteAnnotation(). This endpoint should proxy requests to the Sockudo server REST API.");
+
+        var payload = await PerformPresenceHistoryRequestAsync(
+            config.Endpoint,
+            config.Headers,
+            config.HeadersProvider,
+            channelName,
+            new Dictionary<string, object>(),
+            "delete_annotation",
+            cancellationToken,
+            messageSerial,
+            annotationSerial,
+            socketId).ConfigureAwait(false);
+
+        return new DeleteAnnotationResponse(
+            payload.Get("deleted") as bool? ?? false,
+            payload.Get("annotationSerial") as string ?? annotationSerial,
+            payload.Get("summary") as Dictionary<string, object?>);
+    }
+
+    internal async Task<AnnotationEventsPage> ListAnnotationsAsync(
+        string channelName,
+        string messageSerial,
+        AnnotationEventsParams parameters,
+        CancellationToken cancellationToken = default)
+    {
+        var config = Options.VersionedMessages ?? throw new UnsupportedFeature(
+            "VersionedMessages.Endpoint must be configured to use listAnnotations(). This endpoint should proxy requests to the Sockudo server REST API.");
+
+        var payload = await PerformPresenceHistoryRequestAsync(
+            config.Endpoint,
+            config.Headers,
+            config.HeadersProvider,
+            channelName,
+            parameters.ToPayload(),
+            "list_annotations",
+            cancellationToken,
+            messageSerial).ConfigureAwait(false);
+
+        return DecodeAnnotationEventsPage(
+            payload,
+            cursor => ListAnnotationsAsync(channelName, messageSerial, parameters with { Cursor = cursor }, cancellationToken));
+    }
+
     private async Task<Dictionary<string, object?>> PerformPresenceHistoryRequestAsync(
         string endpoint,
         IDictionary<string, string>? staticHeaders,
@@ -882,7 +960,10 @@ public sealed class SockudoClient : IAsyncDisposable
         IDictionary<string, object> parameters,
         string action,
         CancellationToken cancellationToken,
-        string? messageSerial = null)
+        string? messageSerial = null,
+        string? annotationSerial = null,
+        string? socketId = null,
+        IDictionary<string, object?>? annotation = null)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
         request.Content = JsonContent.Create(new Dictionary<string, object?>
@@ -891,6 +972,9 @@ public sealed class SockudoClient : IAsyncDisposable
             ["params"] = parameters,
             ["action"] = action,
             ["messageSerial"] = messageSerial,
+            ["annotationSerial"] = annotationSerial,
+            ["socketId"] = socketId,
+            ["annotation"] = annotation,
         });
 
         if (staticHeaders is not null)
@@ -1004,6 +1088,23 @@ public sealed class SockudoClient : IAsyncDisposable
 
         return new MessageVersionsPage(
             payload.Get("channel") as string ?? channelName,
+            items,
+            payload.Get("direction") as string ?? "oldest_first",
+            Convert.ToInt32(payload.Get("limit") ?? 0),
+            payload.Get("has_more") as bool? ?? false,
+            payload.Get("next_cursor") as string,
+            fetchNext);
+    }
+
+    private static AnnotationEventsPage DecodeAnnotationEventsPage(
+        Dictionary<string, object?> payload,
+        Func<string, Task<AnnotationEventsPage>> fetchNext)
+    {
+        var items = (payload.Get("items") as IEnumerable<object?> ?? Array.Empty<object?>())
+            .OfType<Dictionary<string, object?>>()
+            .ToArray();
+
+        return new AnnotationEventsPage(
             items,
             payload.Get("direction") as string ?? "oldest_first",
             Convert.ToInt32(payload.Get("limit") ?? 0),
@@ -1173,6 +1274,7 @@ public class SockudoChannel
     public ChannelDeltaSettings? DeltaSettings { get; internal set; }
     public IReadOnlyList<string>? EventsFilter { get; internal set; }
     public SubscriptionRewind? Rewind { get; internal set; }
+    public bool AnnotationSubscribe { get; internal set; }
     public bool IsSubscribed { get; internal set; }
     public bool SubscriptionPending { get; internal set; }
     public bool SubscriptionCancelled { get; internal set; }
@@ -1244,6 +1346,10 @@ public class SockudoChannel
             {
                 payload["rewind"] = Rewind.SubscriptionValue();
             }
+            if (AnnotationSubscribe)
+            {
+                payload["modes"] = new[] { "SUBSCRIBE", "ANNOTATION_SUBSCRIBE" };
+            }
 
             await Client.SendEventAsync(ClientPrefix().Event("subscribe"), payload).ConfigureAwait(false);
         }
@@ -1294,6 +1400,22 @@ public class SockudoChannel
             return;
         }
 
+        if (@event.Event == prefix.Internal("message") &&
+            @event.Data is Dictionary<string, object?> messagePayload &&
+            messagePayload.Get("action") as string == "message.summary")
+        {
+            Emit("message.summary", messagePayload, new EventMetadata(@event.UserId));
+            return;
+        }
+
+        if (@event.Event == prefix.Internal("annotation") &&
+            @event.Data is Dictionary<string, object?> annotationPayload &&
+            annotationPayload.Get("action") is string action)
+        {
+            Emit(action, annotationPayload, new EventMetadata(@event.UserId));
+            return;
+        }
+
         if (!prefix.IsInternalEvent(@event.Event))
         {
             Emit(@event.Event, @event.Data, new EventMetadata(@event.UserId));
@@ -1308,6 +1430,25 @@ public class SockudoChannel
     }
 
     internal ProtocolPrefix ClientPrefix() => new(Client.Options.ProtocolVersion);
+
+    public Task<PublishAnnotationResponse> PublishAnnotationAsync(
+        string messageSerial,
+        PublishAnnotationRequest annotation,
+        CancellationToken cancellationToken = default) =>
+        Client.PublishAnnotationAsync(Name, messageSerial, annotation, cancellationToken);
+
+    public Task<DeleteAnnotationResponse> DeleteAnnotationAsync(
+        string messageSerial,
+        string annotationSerial,
+        string? socketId = null,
+        CancellationToken cancellationToken = default) =>
+        Client.DeleteAnnotationAsync(Name, messageSerial, annotationSerial, socketId, cancellationToken);
+
+    public Task<AnnotationEventsPage> ListAnnotationsAsync(
+        string messageSerial,
+        AnnotationEventsParams? parameters = null,
+        CancellationToken cancellationToken = default) =>
+        Client.ListAnnotationsAsync(Name, messageSerial, parameters ?? new AnnotationEventsParams(), cancellationToken);
 }
 
 public class PrivateChannel : SockudoChannel

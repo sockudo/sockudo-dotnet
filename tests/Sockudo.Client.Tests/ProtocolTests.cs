@@ -220,4 +220,56 @@ public sealed class ProtocolTests
         await page.NextAsync();
         Assert.Equal("cursor-2", capturedCursor);
     }
+
+    [Fact]
+    public void AnnotationRequestPayloadUsesProxyShape()
+    {
+        var payload = new PublishAnnotationRequest(
+            Type: "reactions:distinct.v1",
+            Name: "like",
+            Count: 2,
+            Data: new Dictionary<string, object?> { ["emoji"] = "thumbs-up" },
+            ClientId: "client-1",
+            Extras: new Dictionary<string, object?> { ["source"] = "dotnet" },
+            IdempotencyKey: "anno-1"
+        ).ToPayload();
+
+        Assert.Equal("reactions:distinct.v1", payload["type"]);
+        Assert.Equal("like", payload["name"]);
+        Assert.Equal(2, payload["count"]);
+        Assert.Equal("thumbs-up", ((IDictionary<string, object?>)payload["data"]!)["emoji"]);
+        Assert.Equal("client-1", payload["clientId"]);
+        Assert.Equal("dotnet", ((IDictionary<string, object?>)payload["extras"]!)["source"]);
+        Assert.Equal("anno-1", payload["idempotencyKey"]);
+    }
+
+    [Fact]
+    public async Task AnnotationEventsPageNextUsesNextCursor()
+    {
+        string? capturedCursor = null;
+        var page = new AnnotationEventsPage(
+            Array.Empty<Dictionary<string, object?>>(),
+            "oldest_first",
+            10,
+            true,
+            "anno-cursor-2",
+            cursor =>
+            {
+                capturedCursor = cursor;
+                return Task.FromResult(
+                    new AnnotationEventsPage(
+                        Array.Empty<Dictionary<string, object?>>(),
+                        "oldest_first",
+                        10,
+                        false,
+                        null
+                    )
+                );
+            }
+        );
+
+        Assert.True(page.HasNext());
+        await page.NextAsync();
+        Assert.Equal("anno-cursor-2", capturedCursor);
+    }
 }
